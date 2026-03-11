@@ -449,9 +449,10 @@ class WMFetcher:
         return await self._fetch_page_scrape(session, name, cat_id, sort)
 
     async def _fetch_page_scrape(self, session, name: str, cat_id: str, sort: str) -> list:
-        """Scrape Walmart search HTML page — extracts __NEXT_DATA__ embedded JSON."""
-        keyword = CATEGORY_FALLBACKS.get(name, name)
-        url     = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}&sort={sort}"
+        """Scrape Walmart search HTML — extracts __NEXT_DATA__ embedded JSON."""
+        keyword  = CATEGORY_FALLBACKS.get(name, name)
+        sort_map = {"best_seller": "best_seller", "new": "new"}
+        url      = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}&sort={sort_map.get(sort, sort)}"
         logger.info(f"  WM page scrape: {url}")
         try:
             async with session.get(
@@ -465,71 +466,109 @@ class WMFetcher:
                     return []
                 html = await resp.text()
 
-            # Extract __NEXT_DATA__ JSON embedded in the page
-            marker = '"searchResult"'
-            idx    = html.find(marker)
-            if idx == -1:
-                logger.warning(f"  WM: no searchResult in page for {name}")
-                return []
+            # ── Method 1: __NEXT_DATA__ script tag (Next.js standard) ──────────
+            items = self._extract_next_data(html, name)
+            if items:
+                products = [p for p in items if is_new(p)]
+                logger.info(f"  WM __NEXT_DATA__ {name}: {len(products)} products")
+                return products[:POOL_SIZE]
 
-            # Find the containing JSON object
-            start = html.rfind("{", 0, idx)
-            # Find matching close brace — walk forward
-            depth, end = 0, start
-            for i, ch in enumerate(html[start:], start):
-                if ch == "{": depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
+            # ── Method 2: window.__WML_REDUX_INITIAL_STATE__ ───────────────────
+            items = self._extract_redux_state(html, name)
+            if items:
+                products = [p for p in items if is_new(p)]
+                logger.info(f"  WM redux state {name}: {len(products)} products")
+                return products[:POOL_SIZE]
 
-            try:
-                blob  = json.loads(html[start:end])
-            except Exception:
-                # Try the whole __NEXT_DATA__ script tag instead
-                nd_start = html.find('id="__NEXT_DATA__"')
-                if nd_start == -1:
-                    return []
-                json_start = html.find(">", nd_start) + 1
-                json_end   = html.find("</script>", json_start)
-                try:
-                    blob = json.loads(html[json_start:json_end])
-                except Exception:
-                    return []
-
-            # Walk the blob to find itemStacks
-            def find_items(obj, depth=0):
-                if depth > 10:
-                    return []
-                if isinstance(obj, dict):
-                    if "itemStacks" in obj:
-                        stacks = obj["itemStacks"]
-                        if isinstance(stacks, list) and stacks:
-                            return stacks[0].get("items", [])
-                    if "items" in obj and isinstance(obj["items"], list) and obj["items"]:
-                        first = obj["items"][0]
-                        if isinstance(first, dict) and ("itemId" in first or "usItemId" in first):
-                            return obj["items"]
-                    for v in obj.values():
-                        result = find_items(v, depth + 1)
-                        if result:
-                            return result
-                elif isinstance(obj, list):
-                    for item in obj:
-                        result = find_items(item, depth + 1)
-                        if result:
-                            return result
-                return []
-
-            items    = find_items(blob)
-            products = [p for p in items if is_new(p)]
-            logger.info(f"  WM page scrape {name}: {len(products)} products")
-            return products[:POOL_SIZE]
+            logger.warning(f"  WM: no products found in page for {name}")
+            return []
 
         except Exception as e:
             logger.error(f"WM page scrape error [{name}]: {e}")
             return []
+
+    def _extract_next_data(self, html: str, name: str) -> list:
+        """Extract items from Next.js __NEXT_DATA__ script tag."""
+        try:
+            tag_start = html.find('<script id="__NEXT_DATA__"')
+            if tag_start == -1:
+                return []
+            json_start = html.find(">", tag_start) + 1
+            json_end   = html.find("</script>", json_start)
+            blob = json.loads(html[json_start:json_end])
+            return self._find_items_recursive(blob)
+        except Exception as e:
+            logger.debug(f"  __NEXT_DATA__ parse failed: {e}")
+            return []
+
+    def _extract_redux_state(self, html: str, name: str) -> list:
+        """Extract items from WML Redux state embedded in page."""
+        try:
+            marker = "window.__WML_REDUX_INITIAL_STATE__"
+            idx    = html.find(marker)
+            if idx == -1:
+                return []
+            eq     = html.find("=", idx) + 1
+            end    = html.find("</script>", eq)
+            # Strip trailing semicolon
+            raw    = html[eq:end].strip().rstrip(";")
+            blob   = json.loads(raw)
+            return self._find_items_recursive(blob)
+        except Exception as e:
+            logger.debug(f"  Redux state parse failed: {e}")
+            return []
+
+    def _find_items_recursive(self, obj, _depth=0) -> list:
+        """
+        Walk any JSON blob to find a list of Walmart product items.
+        Checks multiple known keys Walmart uses across versions.
+        """
+        if _depth > 15:
+            return []
+
+        if isinstance(obj, dict):
+            # Direct itemStacks pattern (most common)
+            for stack_key in ("itemStacks", "item_stacks"):
+                stacks = obj.get(stack_key)
+                if isinstance(stacks, list):
+                    for stack in stacks:
+                        if isinstance(stack, dict):
+                            items = stack.get("items") or stack.get("Item") or []
+                            if isinstance(items, list) and items:
+                                first = items[0]
+                                if isinstance(first, dict) and (
+                                    "itemId" in first or "usItemId" in first
+                                    or "id" in first or "title" in first
+                                ):
+                                    return items
+
+            # Direct items list
+            for item_key in ("items", "Products", "products"):
+                items = obj.get(item_key)
+                if isinstance(items, list) and len(items) > 2:
+                    first = items[0] if items else {}
+                    if isinstance(first, dict) and (
+                        "itemId" in first or "usItemId" in first
+                        or "title" in first or "salePrice" in first
+                        or "primaryOffer" in first
+                    ):
+                        return items
+
+            # Recurse into values
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    result = self._find_items_recursive(v, _depth + 1)
+                    if result:
+                        return result
+
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, (dict, list)):
+                    result = self._find_items_recursive(item, _depth + 1)
+                    if result:
+                        return result
+
+        return []
 
     async def test_connection(self) -> tuple:
         """Test Walmart API connectivity — mirrors bb_fetcher.test_connection."""
