@@ -17,11 +17,35 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
-# ── Walmart internal search endpoint ─────────────────────────────────────────
-WM_SEARCH_URL = "https://www.walmart.com/search/api"
+# ── Walmart endpoints ────────────────────────────────────────────────────────
+WM_HOME_URL   = "https://www.walmart.com/"
+WM_SEARCH_URL = "https://www.walmart.com/search"
+WM_API_URL    = "https://www.walmart.com/search/api"
 
-# Realistic browser headers — required or Walmart returns 403/empty
+# Full Chrome 122 header set — Akamai checks header order and completeness
 WM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept":             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language":    "en-US,en;q=0.9",
+    "Accept-Encoding":    "gzip, deflate, br",
+    "Connection":         "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":     "document",
+    "Sec-Fetch-Mode":     "navigate",
+    "Sec-Fetch-Site":     "none",
+    "Sec-Fetch-User":     "?1",
+    "Sec-CH-UA":          '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-CH-UA-Mobile":   "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "DNT":                "1",
+    "Cache-Control":      "max-age=0",
+}
+
+WM_API_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -29,8 +53,16 @@ WM_HEADERS = {
     ),
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer":         "https://www.walmart.com/",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://www.walmart.com/search?q=laptop",
     "Origin":          "https://www.walmart.com",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-origin",
+    "Sec-CH-UA":       '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-CH-UA-Mobile":   "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "DNT": "1",
 }
 
 # ── Categories ────────────────────────────────────────────────────────────────
@@ -271,27 +303,63 @@ class WMFetcher:
     def __init__(self):
         _init_db()
 
+    async def _warm_session(self, session: aiohttp.ClientSession) -> bool:
+        """
+        Visit Walmart homepage first to get real cookies (ak_bmsc, bm_sv, etc).
+        Akamai uses these to validate subsequent API calls.
+        Returns True if warm-up succeeded.
+        """
+        try:
+            logger.info("WM: warming session via homepage...")
+            async with session.get(
+                WM_HOME_URL,
+                headers=WM_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=20),
+                allow_redirects=True,
+            ) as resp:
+                _ = await resp.read()   # consume body so cookies are set
+                logger.info(f"WM homepage: {resp.status} | cookies: {len(session.cookie_jar)}")
+                await asyncio.sleep(2)  # brief pause — mimic human timing
+
+            # Second: hit a real search page (not API) to get search-scoped cookies
+            async with session.get(
+                "https://www.walmart.com/search?q=gaming+laptop",
+                headers=WM_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=20),
+                allow_redirects=True,
+            ) as resp:
+                _ = await resp.read()
+                logger.info(f"WM search warmup: {resp.status}")
+                await asyncio.sleep(1)
+
+            return True
+        except Exception as e:
+            logger.warning(f"WM warm-up failed: {e}")
+            return False
+
     async def fetch_all(self) -> dict:
         cache = _load_cache()
         today = datetime.utcnow().isoformat()
 
-        async with aiohttp.ClientSession(headers=WM_HEADERS) as session:
-            bsr_tasks   = [self._fetch_category(session, name, cat_id, sort="best_seller") for name, cat_id in CATEGORIES]
-            fresh_tasks = [self._fetch_category(session, name, cat_id, sort="new")         for name, cat_id in CATEGORIES]
+        connector = aiohttp.TCPConnector(ssl=True, limit=5)
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=aiohttp.CookieJar()) as session:
+            await self._warm_session(session)
 
-            bsr_results   = await asyncio.gather(*bsr_tasks,   return_exceptions=True)
-            fresh_results = await asyncio.gather(*fresh_tasks, return_exceptions=True)
+            # Sequential fetches to avoid triggering rate limits
+            bsr_results, fresh_results = [], []
+            for name, cat_id in CATEGORIES:
+                bsr_results.append(await self._fetch_category(session, name, cat_id, sort="best_seller"))
+                await asyncio.sleep(1)
+                fresh_results.append(await self._fetch_category(session, name, cat_id, sort="new"))
+                await asyncio.sleep(1)
 
         # Update price cache with today's prices
         cache_updates = []
         output = {}
 
         for i, (name, _) in enumerate(CATEGORIES):
-            bsr_products   = bsr_results[i]   if not isinstance(bsr_results[i],   Exception) else []
-            fresh_products = fresh_results[i] if not isinstance(fresh_results[i], Exception) else []
-
-            if isinstance(bsr_results[i],   Exception): logger.error(f"BSR fetch failed [{name}]: {bsr_results[i]}")
-            if isinstance(fresh_results[i], Exception): logger.error(f"Fresh fetch failed [{name}]: {fresh_results[i]}")
+            bsr_products   = bsr_results[i]   if i < len(bsr_results)   else []
+            fresh_products = fresh_results[i] if i < len(fresh_results) else []
 
             all_products = {str(p.get("itemId") or p.get("usItemId") or ""): p
                             for p in bsr_products + fresh_products}.values()
@@ -339,7 +407,11 @@ class WMFetcher:
         """
         Fetch products from Walmart's internal search API.
         sort: "best_seller" for established pool, "new" for freshness pass.
+        Uses /search (HTML page with embedded JSON) as primary, /search/api as fallback.
         """
+        logger.info(f"WM fetch: {name} | sort={sort}")
+
+        # Try the graphql/internal API first
         params = {
             "query":            name,
             "cat_id":           cat_id,
@@ -348,92 +420,127 @@ class WMFetcher:
             "pref":             "true",
             "prg":              "desktop",
         }
-        logger.info(f"WM fetch: {name} | sort={sort}")
         try:
             async with session.get(
-                WM_SEARCH_URL, params=params,
-                timeout=aiohttp.ClientTimeout(total=25)
+                WM_API_URL, params=params,
+                headers=WM_API_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    raw = await resp.text()
+                    try:
+                        data  = json.loads(raw)
+                        items = (
+                            data.get("items") or
+                            data.get("searchResult", {}).get("itemStacks", [{}])[0].get("items", []) or
+                            []
+                        )
+                        if items:
+                            products = [p for p in items if is_new(p)]
+                            logger.info(f"  {name}: {len(products)} products (sort={sort})")
+                            return products[:POOL_SIZE]
+                    except json.JSONDecodeError:
+                        pass
+                logger.warning(f"  WM API {resp.status} for {name} — trying page scrape")
+        except Exception as e:
+            logger.warning(f"  WM API error [{name}]: {e}")
+
+        # Fallback: scrape the HTML search page for embedded __NEXT_DATA__ JSON
+        return await self._fetch_page_scrape(session, name, cat_id, sort)
+
+    async def _fetch_page_scrape(self, session, name: str, cat_id: str, sort: str) -> list:
+        """Scrape Walmart search HTML page — extracts __NEXT_DATA__ embedded JSON."""
+        keyword = CATEGORY_FALLBACKS.get(name, name)
+        url     = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}&sort={sort}"
+        logger.info(f"  WM page scrape: {url}")
+        try:
+            async with session.get(
+                url,
+                headers=WM_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=True,
             ) as resp:
                 if resp.status != 200:
-                    logger.warning(f"  WM {resp.status} for {name} — trying fallback keyword")
-                    return await self._fetch_fallback(session, name, sort)
-                raw = await resp.text()
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.warning(f"  WM non-JSON response for {name} — fallback")
-                    return await self._fetch_fallback(session, name, sort)
+                    logger.warning(f"  WM page scrape {resp.status} for {name}")
+                    return []
+                html = await resp.text()
 
-            # Walmart wraps items in different shapes depending on endpoint
-            items = (
-                data.get("items") or
-                data.get("searchResult", {}).get("itemStacks", [{}])[0].get("items", []) or
-                []
-            )
+            # Extract __NEXT_DATA__ JSON embedded in the page
+            marker = '"searchResult"'
+            idx    = html.find(marker)
+            if idx == -1:
+                logger.warning(f"  WM: no searchResult in page for {name}")
+                return []
+
+            # Find the containing JSON object
+            start = html.rfind("{", 0, idx)
+            # Find matching close brace — walk forward
+            depth, end = 0, start
+            for i, ch in enumerate(html[start:], start):
+                if ch == "{": depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+
+            try:
+                blob  = json.loads(html[start:end])
+            except Exception:
+                # Try the whole __NEXT_DATA__ script tag instead
+                nd_start = html.find('id="__NEXT_DATA__"')
+                if nd_start == -1:
+                    return []
+                json_start = html.find(">", nd_start) + 1
+                json_end   = html.find("</script>", json_start)
+                try:
+                    blob = json.loads(html[json_start:json_end])
+                except Exception:
+                    return []
+
+            # Walk the blob to find itemStacks
+            def find_items(obj, depth=0):
+                if depth > 10:
+                    return []
+                if isinstance(obj, dict):
+                    if "itemStacks" in obj:
+                        stacks = obj["itemStacks"]
+                        if isinstance(stacks, list) and stacks:
+                            return stacks[0].get("items", [])
+                    if "items" in obj and isinstance(obj["items"], list) and obj["items"]:
+                        first = obj["items"][0]
+                        if isinstance(first, dict) and ("itemId" in first or "usItemId" in first):
+                            return obj["items"]
+                    for v in obj.values():
+                        result = find_items(v, depth + 1)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = find_items(item, depth + 1)
+                        if result:
+                            return result
+                return []
+
+            items    = find_items(blob)
             products = [p for p in items if is_new(p)]
-            logger.info(f"  {name}: {len(products)} products (sort={sort})")
+            logger.info(f"  WM page scrape {name}: {len(products)} products")
             return products[:POOL_SIZE]
 
-        except asyncio.TimeoutError:
-            logger.error(f"WM timeout [{name}]")
-            return []
         except Exception as e:
-            logger.error(f"WM fetch error [{name}]: {e}")
-            return []
-
-    async def _fetch_fallback(self, session, name: str, sort: str) -> list:
-        """Fallback: search by keyword instead of category ID."""
-        keyword = CATEGORY_FALLBACKS.get(name, name)
-        params  = {
-            "query": keyword,
-            "sort":  sort,
-            "affinityOverride": "default",
-        }
-        logger.info(f"  WM fallback keyword search: '{keyword}'")
-        try:
-            async with session.get(
-                WM_SEARCH_URL, params=params,
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data  = await resp.json(content_type=None)
-                items = (
-                    data.get("items") or
-                    data.get("searchResult", {}).get("itemStacks", [{}])[0].get("items", []) or
-                    []
-                )
-                products = [p for p in items if is_new(p)]
-                logger.info(f"  WM fallback: {len(products)} products")
-                return products[:POOL_SIZE]
-        except Exception as e:
-            logger.error(f"WM fallback error [{name}]: {e}")
+            logger.error(f"WM page scrape error [{name}]: {e}")
             return []
 
     async def test_connection(self) -> tuple:
         """Test Walmart API connectivity — mirrors bb_fetcher.test_connection."""
-        async with aiohttp.ClientSession(headers=WM_HEADERS) as session:
-            params = {
-                "query": "gaming laptop",
-                "sort":  "best_seller",
-                "affinityOverride": "default",
-            }
+        connector = aiohttp.TCPConnector(ssl=True)
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=aiohttp.CookieJar()) as session:
+            await self._warm_session(session)
             try:
-                async with session.get(
-                    WM_SEARCH_URL, params=params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        return False, f"HTTP {resp.status} — Walmart may be blocking", ""
-                    data  = await resp.json(content_type=None)
-                    items = (
-                        data.get("items") or
-                        data.get("searchResult", {}).get("itemStacks", [{}])[0].get("items", []) or
-                        []
-                    )
-                    if items:
-                        sample = (items[0].get("title") or items[0].get("name") or "—")[:60]
-                        return True, len(items), sample
-                    return False, "Connected but no products returned", ""
+                products = await self._fetch_category(session, "Gaming Laptops", "3944_3951_132959", sort="best_seller")
+                if products:
+                    sample = (products[0].get("title") or products[0].get("name") or "—")[:60]
+                    return True, len(products), sample
+                return False, "Connected but no products returned", ""
             except Exception as e:
                 return False, f"Connection error: {e}", ""
