@@ -576,10 +576,37 @@ class WMFetcher:
         async with aiohttp.ClientSession(connector=connector, cookie_jar=aiohttp.CookieJar()) as session:
             await self._warm_session(session)
             try:
+                # Raw HTML fetch for diagnostics
+                keyword = "gaming laptop"
+                url     = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}"
+                async with session.get(url, headers=WM_HEADERS,
+                                       timeout=aiohttp.ClientTimeout(total=30),
+                                       allow_redirects=True) as resp:
+                    html = await resp.text()
+                    logger.info(f"WM test page status: {resp.status} | len: {len(html)}")
+
+                    # Log what script tags exist
+                    import re
+                    script_ids = re.findall(r'<script[^>]+id="([^"]+)"', html)
+                    logger.info(f"WM script tag IDs found: {script_ids}")
+
+                    # Check for key markers
+                    for marker in ("__NEXT_DATA__", "__WML_REDUX_INITIAL_STATE__",
+                                   "itemStacks", "itemId", "usItemId", "searchResult"):
+                        idx = html.find(marker)
+                        logger.info(f"  marker '{marker}': {'FOUND at ' + str(idx) if idx != -1 else 'NOT FOUND'}")
+
+                    # Log first 500 chars of __NEXT_DATA__ if present
+                    nd = html.find('<script id="__NEXT_DATA__"')
+                    if nd != -1:
+                        snippet_start = html.find(">", nd) + 1
+                        logger.info(f"  __NEXT_DATA__ snippet: {html[snippet_start:snippet_start+300]}")
+
                 products = await self._fetch_category(session, "Gaming Laptops", "3944_3951_132959", sort="best_seller")
                 if products:
                     sample = (products[0].get("title") or products[0].get("name") or "—")[:60]
                     return True, len(products), sample
                 return False, "Connected but no products returned", ""
             except Exception as e:
+                logger.exception("WM test_connection error")
                 return False, f"Connection error: {e}", ""
